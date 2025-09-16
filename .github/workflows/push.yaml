@@ -1,0 +1,14 @@
+name: Push
+permissions: {}
+
+on:
+  repository_dispatch:
+    types: [push-command]
+
+jobs:
+  _isCheck_push:
+    name: Push Job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulate build process
+        run: echo "Pushing the project..."
