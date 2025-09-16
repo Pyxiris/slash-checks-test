@@ -1,0 +1,211 @@
+name: Update Slash Command Check Status
+
+on:
+  pull_request: # To create pending checks
+    types: [opened, synchronize]
+  workflow_run:
+    # This workflow runs when any of the specified workflows complete.
+    # The `workflows` key is a mandatory requirement for the `workflow_run` trigger.
+    # We list all other workflows in the repository here.
+    # This workflow ("Update Slash Command Check Status") is excluded to prevent loops.
+    workflows:
+      - "Build"
+      - "Push"
+      - "dispatch"
+    types: [completed] # To update status after a slash command workflow runs
+
+jobs:
+  # This job runs first for both triggers. It checks out the workflow files
+  # and identifies which jobs are slash-command checks.
+  # This avoids duplicating this logic in the jobs below.
+  discover-checks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # To read workflow files
+    outputs:
+      check_jobs: ${{ steps.get_check_jobs.outputs.check_jobs }}
+
+    steps:
+      - name: Get Workflow files
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: |
+            .github/workflows
+
+      - name: Identify Slash Command Checks
+        id: get_check_jobs
+        run: |
+          # Download yq to a temporary directory to avoid PATH conflicts with the pre-installed version.
+          # We will call this binary using its absolute path.
+          YQ_PATH="${{ runner.temp }}/yq"
+          wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O "$YQ_PATH"
+          chmod +x "$YQ_PATH"
+          
+          all_workflow_checks="{}" # This will store the final JSON output
+          workflow_dir="${{ github.workspace }}/.github/workflows"
+          check_job_prefix="_isCheck_"
+
+          for file in "$workflow_dir"/*.yml "$workflow_dir"/*.yaml; do
+            if [ ! -f "$file" ]; then continue; fi
+
+            workflow_name=$("$YQ_PATH" '.name' "$file")
+            if [ -z "$workflow_name" ] || [ "$workflow_name" == "null" ]; then
+              echo "::warning file=$file::Workflow file has no 'name' property. Skipping."
+              continue
+            fi
+
+            # Get all job_ids that start with the prefix
+            check_job_ids=$("$YQ_PATH" --arg prefix "$check_job_prefix" '(.jobs | keys)[] | select(startswith($prefix))' "$file")
+
+            # A workflow is only a "slash command" workflow if it has check jobs AND a repository_dispatch trigger.
+            dispatch_type=$("$YQ_PATH" '.on.repository_dispatch.types[0]' "$file")
+
+            if [ -n "$check_job_ids" ] && [ -n "$dispatch_type" ] && [ "$dispatch_type" != "null" ]; then
+              # The command is derived from the dispatch type, e.g., "build-command" -> "build"
+              command=$(echo "$dispatch_type" | sed 's/-command$//')
+
+              workflow_checks_array="[]" # Array to hold checks for the current workflow
+              for job_id in $check_job_ids; do
+                # Get the job's display name, fallback to the job_id itself if not present
+                check_job_name=$("$YQ_PATH" --arg id "$job_id" '.jobs[$id].name // $id' "$file")
+                workflow_checks_array=$(echo "$workflow_checks_array" | jq --arg job_id "$job_id" --arg check_name "$check_job_name" '. + [{"job_id": $job_id, "check_name": $check_name}]')
+              done
+
+              # The output for each workflow will be an object containing the command and the list of checks.
+              workflow_object=$(jq -n --arg cmd "$command" --argjson checks_array "$workflow_checks_array" '{"command": $cmd, "checks": $checks_array}')
+
+              # Add this workflow object to the main map, keyed by the workflow's display name.
+              all_workflow_checks=$(echo "$all_workflow_checks" | jq --arg wf_name "$workflow_name" --argjson wf_obj "$workflow_object" '. + {($wf_name): $wf_obj}')
+            fi
+          done
+
+          echo "check_jobs=$all_workflow_checks" >> $GITHUB_OUTPUT
+
+  # This job runs on PR creation/update to create 'pending' checks for all slash commands.
+  # This gives immediate feedback to the user about available commands.
+  create-pending-checks:
+    name: Create Pending Checks
+    needs: discover-checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      checks: write # To create checks
+
+    steps:
+      - name: Create Pending Status Checks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const allCheckJobs = JSON.parse('${{ needs.discover-checks.outputs.check_jobs }}');
+            if (Object.keys(allCheckJobs).length === 0) {
+              console.log('No slash command checks found.');
+              return;
+            }
+
+            const sha = "${{ github.event.pull_request.head.sha }}";
+
+            for (const workflowName in allCheckJobs) { // e.g., "Build"
+              const workflowData = allCheckJobs[workflowName]; // e.g., { "command": "build", "checks": [...] }
+              const command = workflowData.command;
+              const checksInWorkflow = workflowData.checks;
+
+              for (const check of checksInWorkflow) { // Iterate through each check defined in the workflow
+                await github.rest.checks.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: check.check_name, // Use the specific check's display name
+                  head_sha: sha,
+                  status: 'queued',
+                  output: {
+                    title: 'Awaiting Slash Command',
+                    summary: `This check is awaiting a slash command to be triggered.`,
+                    text: `To run this check, comment \`/${command}\` on the pull request.`
+                  }
+                });
+              }
+            }
+
+  # This job runs when a slash-command-triggered workflow completes and updates the final status.
+  update-final-status:
+    name: Update Final Check Status
+    needs: discover-checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_run'
+    permissions:
+      checks: write
+      pull-requests: read # To get PR info
+      actions: read # To list jobs for a workflow run
+
+    steps:
+      - name: 'Get PR Info'
+        id: get_pr_info
+        run: |
+          # Extract PR URL and head SHA from the event payload
+          PR_URL=$(jq -r '.workflow_run.pull_requests[0].url' "$GITHUB_EVENT_PATH")
+          if [ -z "$PR_URL" ] || [ "$PR_URL" == "null" ]; then
+            echo "No PR associated with this workflow run. Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Get PR details, including head repo for checkout
+          PR_DATA=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" $PR_URL)
+          PR_HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+          echo "sha=$PR_HEAD_SHA" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 'Find matching check and update status'
+        # This condition is simpler and more readable than the fromJSON equivalent.
+        if: steps.get_pr_info.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const triggeredWorkflowName = context.payload.workflow_run.name;
+            const allCheckJobs = JSON.parse('${{ needs.discover-checks.outputs.check_jobs }}'); // e.g., {"Build": {"command": "build", "checks": [...]}}
+            
+            const workflowData = allCheckJobs[triggeredWorkflowName];
+
+            if (!workflowData || !workflowData.checks || workflowData.checks.length === 0) {
+              console.log(`Workflow "${triggeredWorkflowName}" does not contain any jobs prefixed with '_isCheck_'. Skipping.`);
+              return;
+            }
+
+            const { id: run_id } = context.payload.workflow_run;
+            const sha = "${{ steps.get_pr_info.outputs.sha }}";
+
+            // Fetch all jobs for the completed workflow run to get individual job conclusions and URLs
+            const { data: { jobs: completedJobs } } = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run_id
+            });
+
+            for (const expectedCheck of workflowData.checks) { // Iterate through each expected check
+              // Find the corresponding completed job by its display name (check_name)
+              // The `job.name` from the API response is the `name` property defined in the YAML job.
+              const matchingCompletedJob = completedJobs.find(job => job.name === expectedCheck.check_name);
+
+              if (matchingCompletedJob) {
+                const jobConclusion = matchingCompletedJob.conclusion;
+                const jobHtmlUrl = matchingCompletedJob.html_url;
+
+                await github.rest.checks.create({ // create or update the specific check
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: expectedCheck.check_name, // Use the specific check's display name
+                  head_sha: sha,
+                  status: 'completed',
+                  conclusion: jobConclusion,
+                  output: {
+                    title: `Job run ${jobConclusion}`,
+                    summary: `The "${expectedCheck.check_name}" job in workflow "${triggeredWorkflowName}" finished with status: ${jobConclusion}.`,
+                    text: `The job run for this check has completed with status: **${jobConclusion}**.`
+                  },
+                  details_url: jobHtmlUrl // Link to the specific job run
+                });
+              } else {
+                console.log(`Could not find a completed job matching check "${expectedCheck.check_name}" in workflow run ${run_id}. It might have been skipped.`);
+                // Optionally, create a 'skipped' or 'neutral' check here if the job was expected but not found.
+                // For now, we'll just log and skip updating this specific check.
+              }
+            }
