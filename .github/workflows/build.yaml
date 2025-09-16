@@ -1,0 +1,14 @@
+name: Build
+permissions: {}
+
+on:
+  repository_dispatch:
+    types: [build-command]
+
+jobs:
+  _isCheck_build:
+    name: Build Job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulate build process
+        run: echo "Building the project..."
