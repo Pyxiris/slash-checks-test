@@ -1,0 +1,38 @@
+name: dispatch
+permissions: {}
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token
+        id: generate_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PYXIRIS_APP_ID }}
+          private-key: ${{ secrets.PYXIRIS_APP_SECRET }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Dispatch workflow
+        # Using a more recent version for bug fixes and new features.
+        uses: peter-evans/workflow-dispatch@v3
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          reactions: false
+          config: >
+            [
+              {
+                "command": "build",
+                "permission": "maintain",
+                "issue_type": "both"
+              },
+              {
+                "command": "push",
+                "permission": "maintain",
+                "issue_type": "both"
+              }
+            ]
