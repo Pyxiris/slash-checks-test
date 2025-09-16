@@ -1,0 +1,67 @@
+name: Build
+permissions: {}
+
+on:
+  pull_request:
+  repository_dispatch: # Triggered by the /build slash command
+    types: [build-command]
+
+jobs:
+  build:
+    name: Build Job
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    # This job only runs for the slash command, not for the pull_request trigger.
+    # It also validates that the SHA from the command matches the PR's head SHA from the event payload.
+    if: |
+      github.event_name == 'repository_dispatch' &&
+      github.event.client_payload.slash_command.args.named.sha != '' &&
+      startsWith( 
+        github.event.client_payload.pull_request.head.sha, 
+        github.event.client_payload.slash_command.args.named.sha
+      )
+    steps:
+      - name: Simulate build process
+        run: echo "Building the project..."
+
+      - uses: actions/github-script@v6
+        id: update-check-run
+        if: ${{ always() }}
+        env:
+          # This is the SHA of the PR head at the time the slash command was dispatched.
+          # Using this value is critical to avoid the race condition you mentioned.
+          PR_HEAD_SHA: ${{ github.event.client_payload.pull_request.head.sha }}
+          # The check is named after the job's 'name' property, as confirmed by the error log.
+          CHECK_NAME: 'Build Job'
+          # Conveniently, job.status maps to the check run conclusion.
+          CONCLUSION: ${{ job.status }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { PR_HEAD_SHA, CHECK_NAME, CONCLUSION } = process.env;
+            
+            core.info(`Searching for check run named "${CHECK_NAME}" on ref "${PR_HEAD_SHA}"`);
+            
+            const { data: { check_runs } } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: PR_HEAD_SHA,
+            });
+
+            const targetCheck = check_runs.find(check => check.name === CHECK_NAME);
+
+            if (!targetCheck) {
+              const availableChecks = check_runs.map(c => c.name).join('", "');
+              throw new Error(`Could not find check run named "${CHECK_NAME}". Found these checks instead: ["${availableChecks}"]`);
+            }
+
+            core.info(`Found check run with ID ${targetCheck.id}. Updating status to "${CONCLUSION}".`);
+
+            await github.rest.checks.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              check_run_id: targetCheck.id,
+              status: 'completed',
+              conclusion: CONCLUSION
+            });
