@@ -1,0 +1,40 @@
+name: Build
+permissions: {}
+
+on:
+  repository_dispatch: # Triggered by the /build slash command
+    types: [build-command]
+
+jobs:
+  _isCheck_build:
+    name: Build Job
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    if: |
+      github.event.client_payload.slash_command.args.named.sha != '' &&
+      startsWith( 
+        github.event.client_payload.pull_request.head.sha, 
+        github.event.client_payload.slash_command.args.named.sha
+      )
+    steps:
+      - name: Save client_payload
+        run: echo '${{ toJSON(github.event.client_payload) }}' > client_payload.json
+
+      - name: Upload client_payload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-payload
+          path: client_payload.json
+          retention-days: 1
+
+      - name: Simulate build process
+        run: echo "Building the project..."
+
+      - name: Generate token
+        id: generate_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PYXIRIS_APP_ID }}
+          private-key: ${{ secrets.PYXIRIS_APP_SECRET }}
+          owner: ${{ github.repository_owner }}
