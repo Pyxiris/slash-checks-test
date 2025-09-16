@@ -1,0 +1,26 @@
+name: Push
+permissions: {}
+
+on:
+  repository_dispatch:
+    types: [push-command]
+
+jobs:
+  _isCheck_push:
+    name: Push Job
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: Save client_payload
+        run: echo '${{ toJSON(github.event.client_payload) }}' > client_payload.json
+
+      - name: Upload client_payload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-payload
+          path: client_payload.json
+          retention-days: 1
+
+      - name: Simulate build process
+        run: echo "Pushing the project..."
