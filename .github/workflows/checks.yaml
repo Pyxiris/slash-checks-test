@@ -1,0 +1,235 @@
+name: Update Slash Command Check Status
+
+# on:
+#   pull_request_target: # To create pending checks. Runs in base repo context with access to vars/secrets.
+#     types: [opened, synchronize, reopened]
+#   workflow_run:
+#     # This workflow runs when any of the specified workflows complete.
+#     # The `workflows` key is a mandatory requirement for the `workflow_run` trigger.
+#     # We list all other workflows in the repository here.
+#     # This workflow ("Update Slash Command Check Status") is excluded to prevent loops.
+#     workflows:
+#       - "Build"
+#       - "Push"
+#     types: [completed] # To update status after a slash command workflow runs
+
+jobs:
+  setup-checks:
+    name: Setup Checks
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+      actions: read
+
+    steps:
+      # This step discovers all available slash command checks from the workflow files.
+      # It runs for both pull_request_target and workflow_run events.
+      - name: Get Workflow files
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: |
+            .github/workflows
+      - name: Identify Slash Command Checks
+        id: get_check_jobs
+        run: |
+           all_workflow_checks="{}" # This will store the final JSON output
+           workflow_dir="${{ github.workspace }}/.github/workflows"
+           check_job_prefix="_isCheck_"
+ 
+           for file in "$workflow_dir"/*.yml "$workflow_dir"/*.yaml; do
+             if [ ! -f "$file" ]; then continue; fi
+ 
+             workflow_name=$(yq '.name' "$file")
+             if [ -z "$workflow_name" ] || [ "$workflow_name" == "null" ]; then
+               echo "::warning file=$file::Workflow file has no 'name' property. Skipping."
+               continue
+             fi
+ 
+             check_job_ids=$(yq '(.jobs | keys)[]' "$file" | grep -E "^${check_job_prefix}" || true)
+             dispatch_type=$(yq '.on.repository_dispatch.types[0]' "$file")
+ 
+             if [ -n "$check_job_ids" ] && [ -n "$dispatch_type" ] && [ "$dispatch_type" != "null" ]; then
+               command=$(echo "$dispatch_type" | sed 's/-command$//')
+ 
+               workflow_checks_array="[]" # Array to hold checks for the current workflow
+               for job_id in $check_job_ids; do
+                 check_job_name=$(yq -o=json "$file" | jq --arg id "$job_id" -r '.jobs[$id].name // $id')
+                 workflow_checks_array=$(echo "$workflow_checks_array" | jq --arg job_id "$job_id" --arg check_name "$check_job_name" '. + [{"job_id": $job_id, "check_name": $check_name}]')
+               done
+ 
+               workflow_object=$(jq -n --arg cmd "$command" --argjson checks_array "$workflow_checks_array" '{"command": $cmd, "checks": $checks_array}')
+               all_workflow_checks=$(echo "$all_workflow_checks" | jq --arg wf_name "$workflow_name" --argjson wf_obj "$workflow_object" '. + {($wf_name): $wf_obj}')
+             fi
+           done
+ 
+           echo "check_jobs=$(echo "$all_workflow_checks" | jq -c .)" >> $GITHUB_OUTPUT
+
+      # The following steps run only for pull requests to create the initial pending checks.
+      - name: Generate token for PR Checks
+        if: github.event_name == 'pull_request_target'
+        id: generate_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PYXIRIS_APP_ID }}
+          private-key: ${{ secrets.PYXIRIS_APP_SECRET }}
+          owner: ${{ github.repository_owner }}
+
+          
+      - name: Create Pending Status Checks
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.generate_token.outputs.token }}
+          script: |
+             const allCheckJobs = JSON.parse('${{ steps.get_check_jobs.outputs.check_jobs }}');
+             if (Object.keys(allCheckJobs).length === 0) {
+               console.log('No slash command checks found.');
+               return;
+             }
+ 
+             const sha = "${{ github.event.pull_request.head.sha }}";
+ 
+             for (const workflowName in allCheckJobs) { // e.g., "Build"
+               const workflowData = allCheckJobs[workflowName]; // e.g., { "command": "build", "checks": [...] }
+               const command = workflowData.command;
+               const checksInWorkflow = workflowData.checks;
+ 
+               for (const check of checksInWorkflow) { // Iterate through each check defined in the workflow
+                 await github.rest.checks.create({
+                   owner: context.repo.owner,
+                   repo: context.repo.repo,
+                   name: check.check_name, // Use the specific check's display name
+                   head_sha: sha,
+                   status: 'queued',
+                   output: {
+                     title: 'Awaiting Slash Command',
+                     summary: 'This check is awaiting a slash command with a specific commit SHA.',
+                     text: `To run this check, comment \`/${command} sha=${sha.substring(0,7)}\` on the pull request.`
+                   }
+                 });
+               }
+             }
+
+
+
+      - name: Dump API Response
+        id: dump-response
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const runId = context.payload.workflow_run.id;
+            const repo = context.repo;
+            
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner: repo.owner,
+              repo: repo.repo,
+              run_id: runId
+            });
+
+            // Log the entire API response object
+            core.info('--- Full API Response for Workflow Run ---');
+            core.info(JSON.stringify(run, null, 2)); // The '2' argument pretty-prints with 2 spaces
+            core.info('------------------------------------------');
+            
+
+
+
+      # The following steps run only after a slash command workflow completes, to update the final check status.
+      # - name: Get PR Info for Workflow Run
+      #   if: github.event_name == 'workflow_run'
+      #   id: get_pr_info
+      #   run: |
+      #      # The workflow_run event is not executed in the context of a PR.
+      #      # We must use the GitHub API to find the PR and its current state, as you suggested.
+
+      #      # 1. Get the commit SHA that the slash-command workflow (`Build`, `Push`, etc.) ran against.
+      #      # This is the PR's head SHA at the time the command was issued.
+      #      SHA_AT_COMMAND_TIME=$(jq -r '.workflow_run.head_sha' "$GITHUB_EVENT_PATH")
+
+      #      # 2. Use the API to find the pull request associated with that commit.
+      #      # This API call returns the PR's *latest* data, including its number and its *current* head SHA.
+      #      # We sort by `updated_at` to get the most recent PR if there are multiple.
+      #      PR_LATEST_DATA=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+      #        "https://api.github.com/repos/${{ github.repository }}/commits/$SHA_AT_COMMAND_TIME/pulls" | jq 'sort_by(.updated_at) | .[-1]')
+
+      #      CURRENT_PR_HEAD_SHA=$(echo "$PR_LATEST_DATA" | jq -r '.head.sha')
+      #      PR_NUMBER=$(echo "$PR_LATEST_DATA" | jq -r '.number')
+
+      #      if [ -z "$CURRENT_PR_HEAD_SHA" ] || [ "$CURRENT_PR_HEAD_SHA" == "null" ]; then
+      #        echo "Could not find an associated PR for commit $SHA_AT_COMMAND_TIME. This can happen with `repository_dispatch`. Skipping."
+      #        echo "skip=true" >> $GITHUB_OUTPUT
+      #        exit 0
+      #      fi
+
+      #      # 3. For the race condition check, we pass both the original and current SHAs to the next step.
+      #      echo "Found PR #$PR_NUMBER. SHA at command time: $SHA_AT_COMMAND_TIME. PR's current head SHA: $CURRENT_PR_HEAD_SHA."
+      #      echo "sha_at_command_time=$SHA_AT_COMMAND_TIME" >> $GITHUB_OUTPUT
+      #      echo "current_pr_head_sha=$CURRENT_PR_HEAD_SHA" >> $GITHUB_OUTPUT
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # - name: Find matching check and update status
+      #   if: github.event_name == 'workflow_run' && steps.get_pr_info.outputs.skip != 'true'
+      #   uses: actions/github-script@v7
+      #   with:
+      #     script: |
+      #        const triggeredWorkflowName = context.payload.workflow_run.name;
+      #        const allCheckJobs = JSON.parse('${{ steps.get_check_jobs.outputs.check_jobs }}'); // e.g., {"Build": {"command": "build", "checks": [...]}}
+             
+      #        const workflowData = allCheckJobs[triggeredWorkflowName];
+ 
+      #        if (!workflowData || !workflowData.checks || workflowData.checks.length === 0) {
+      #          console.log(`Workflow "${triggeredWorkflowName}" does not contain any jobs prefixed with '_isCheck_'. Skipping.`);
+      #          return;
+      #        }
+
+      #        const shaFromCommand = "${{ steps.get_pr_info.outputs.sha_at_command_time }}";
+      #        const currentPrHeadSha = "${{ steps.get_pr_info.outputs.current_pr_head_sha }}";
+
+      #        // This is the critical race condition check.
+      #        // If the PR's head SHA has changed since the command was issued, we must not post a stale result.
+      #        if (shaFromCommand !== currentPrHeadSha) {
+      #          console.log(`Race condition detected: SHA from command run (${shaFromCommand}) does not match current PR head SHA (${currentPrHeadSha}). Skipping status update.`);
+      #          return;
+      #        }
+
+      #        const { id: run_id } = context.payload.workflow_run;
+      #        // Since the SHAs match, we can use the current head SHA to update the check.
+      #        const sha = currentPrHeadSha;
+
+      #        // Fetch all jobs for the completed workflow run to get individual job conclusions and URLs
+      #        const { data: { jobs: completedJobs } } = await github.rest.actions.listJobsForWorkflowRun({
+      #          owner: context.repo.owner,
+      #          repo: context.repo.repo,
+      #          run_id: run_id
+      #        });
+ 
+      #        for (const expectedCheck of workflowData.checks) { // Iterate through each expected check
+      #          // Find the corresponding completed job by its display name (check_name)
+      #          // The `job.name` from the API response is the `name` property defined in the YAML job.
+      #          const matchingCompletedJob = completedJobs.find(job => job.name === expectedCheck.check_name);
+ 
+      #          if (matchingCompletedJob) {
+      #            const jobConclusion = matchingCompletedJob.conclusion;
+      #            const jobHtmlUrl = matchingCompletedJob.html_url;
+ 
+      #            await github.rest.checks.create({ // create or update the specific check
+      #              owner: context.repo.owner,
+      #              repo: context.repo.repo,
+      #              name: expectedCheck.check_name, // Use the specific check's display name
+      #              head_sha: sha,
+      #              status: 'completed',
+      #              conclusion: jobConclusion,
+      #              output: {
+      #                title: `Job run ${jobConclusion}`,
+      #                summary: `The "${expectedCheck.check_name}" job in workflow "${triggeredWorkflowName}" finished with status: ${jobConclusion}.`,
+      #                text: `The job run for this check has completed with status: **${jobConclusion}**.`
+      #              },
+      #              details_url: jobHtmlUrl // Link to the specific job run
+      #            });
+      #          } else {
+      #            console.log(`Could not find a completed job matching check "${expectedCheck.check_name}" in workflow run ${run_id}. It might have been skipped.`);
+      #          }
+      #        }
